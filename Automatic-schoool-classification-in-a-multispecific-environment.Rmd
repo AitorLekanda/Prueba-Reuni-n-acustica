@@ -1,0 +1,975 @@
+---
+title: "SCHOOL CLASSIFICATION IN A MULTISPECIFIC PELAGIC ENVIRONMENT"
+author: "Aitor Lekanda"
+date: "Last modified in `r format(Sys.Date(),'%e de %B, %Y')`"
+---
+<style>
+body{
+  font-family: Times New Roman;
+  size=11;
+}
+pre {
+color
+}
+</style>
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(fig.align = 'center', out.width = "50%", echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:/use/OneDrive - AZTI/JUVENA CLASSIFICATION")
+```
+
+```{r Load packages, include=FALSE}
+
+#rm(list = ls())
+
+# Library
+  ## Tables in markdown
+library(knitr)
+library(kableExtra)
+  ## Data manipulation
+library(dplyr)
+library(tibble)
+library(tidyverse)
+  ## Dates
+library(lubridate)
+  ## Plots
+library(ggplot2)
+library(ggrepel)
+  ## Distance
+library(geosphere)
+  ## Bathymetry
+library(raster)
+library(sf)
+library(rnaturalearth)
+  ## Closest function
+library("DescTools")
+  ## Data partition
+library(caret)
+#Variables importance
+  library(vip)
+  ## Glmnet
+library(glmnet)
+  ## Multivariate random forest
+#library(MultivariateRandomForest)
+library(randomForestSRC)
+  ## Root Mean Square Error (RMSE)
+library(ModelMetrics)
+
+```
+
+```{r Read data, include=FALSE}
+# Read data
+data <- read.csv("Data/Data/SchoolClassificationData_2014_2020.csv")
+  data$Time_M <- hms(data$Time_M)
+  data <- subset(data, hour(data$Time_M) < 18)
+
+hauls <- read.csv(file="Data/Stations/Filtered_Juvena_2013_2020_3.csv", sep=",", dec=".", header=TRUE)
+  
+```
+
+## Datasets
+Until `r format(Sys.Date(),'%e de %B, %Y')` data from `r max(data$Year)` to `r min(data$Year)` has been analysed during daytime. A total of `r nrow(data)` schools from `r length(unique(data$Haul_ID))` hauls have been included in the models to classify into the most probable species:
+
+- `ANE`: Anchovy
+- `PIL`: Sardine
+- `HOM`: Horse mackerel
+- `HMM`: Mediterranean horse mackerel
+- `MAC`: Atlantic mackerel
+- `VMA`: Atlantic chub mackerel
+- `SPR`: Sprat
+- `BOC`: Boarfish
+- `MAV`: Muller's pearsides
+- `KRX`: Krill
+
+## Data partitioning
+For training the multivariate regression models we divide the data set into `train_data` and `test_data` data, as we want to see models' performance when it is used in new data, in this case `test_data`. The `createDataPartition`function included in the `caret` package allows to balanced subsampling. In this way the model will be trained similar species distribution as tested in predictions. As we included collective properties which have the same value for all the schools present in the EDSU, and we do not want to give clues to the model when predicting in test data, we decided to do the data partition into `hauls`. As the species proportion is not exact in all hauls, first we generalized the species proportion. Then, we divided the fishing hauls into `traindata` and `testdata`, and chose the schools in selected hauls, trying to obtain, more or less, 75% of schools in the `traindata` and 25% in the `testdata`.
+
+```{r Data partitioning, warning=FALSE}
+# Generalize the species proportion for the data partition
+generalized_hauls <- hauls %>% filter(Haul_ID %in% data$Haul_ID)
+
+for (i in 1:nrow(generalized_hauls)) {
+  for (j in 26:36) {
+    if (generalized_hauls[i,j] <= 0.05){
+      generalized_hauls[i,j] <- 0
+    }
+    if (generalized_hauls[i,j]>0.05 & generalized_hauls[i,j]<=0.25){
+      generalized_hauls[i,j] <- 0.2
+    }
+    if (generalized_hauls[i,j]>0.25 & generalized_hauls[i,j]<=0.5){
+      generalized_hauls[i,j] <- 0.4
+    }
+    if (generalized_hauls[i,j]>0.5 & generalized_hauls[i,j]<=0.75){
+      data[i,j] <- 0.6
+    }
+    if (generalized_hauls[i,j]>0.75 & generalized_hauls[i,j]<0.95){
+      generalized_hauls[i,j] <- 0.8
+    }
+    if (generalized_hauls[i,j] >= 0.95){
+      generalized_hauls[i,j] <- 1
+    }
+  }
+}
+
+set.seed(123)
+trainRowNumbers <- createDataPartition (paste(generalized_hauls$ANE_P,
+                                              generalized_hauls$PIL_P,
+                                              generalized_hauls$HOM_P,
+                                              generalized_hauls$HMM_P,
+                                              generalized_hauls$MAC_P,
+                                              generalized_hauls$VMA_P,
+                                              generalized_hauls$SPR_P,
+                                              generalized_hauls$BOC_P,
+                                              generalized_hauls$MAV_P,
+                                              generalized_hauls$KRX_P,
+                                              generalized_hauls$Others_P), 
+                                        p=0.6, 
+                                        list=FALSE)
+
+traindata <- generalized_hauls[trainRowNumbers,]
+testdata <- generalized_hauls[-trainRowNumbers,]
+
+# Haul data partition percentage
+nrow(traindata)/nrow(generalized_hauls)
+
+traindata <- data %>% filter (Haul_ID %in% traindata$Haul_ID)
+
+testdata <- data %>% filter (Haul_ID %in% testdata$Haul_ID)
+
+# School data partition percentage
+nrow(traindata)/nrow(data)
+
+```
+
+```{r, include=FALSE}
+# Train data
+train_Haul_ID <- traindata %>% dplyr::select(Haul_ID)
+train_School_ID <- traindata %>% dplyr::select(School_ID)
+traindata <- traindata %>% dplyr::select(-X,-Survey,-Vessel)
+traindata$Year <- as.numeric(as.character(traindata$Year))
+traindata$Time_M <- as.numeric(hms(traindata$Time_M))
+traindata$Date_M <- as.numeric(ymd(traindata$Date_M))
+
+## Explanatory variables
+train_x <- traindata %>% dplyr::select(
+  # Haul info
+  Time_M, #Year, Date_M,  
+  # Positional
+  #Bathymetry, #Lat, Lon, 
+  # Energetic
+  Sv_max_LF, Sv_min_LF, Sv_mean_LF,  
+  Sv_max_MF, Sv_min_MF, Sv_mean_MF, 
+  Sv_max_HF, Sv_min_HF, Sv_mean_HF, 
+  Sv_mean_response_1, Sv_max_response_1, Sv_min_response_1, 
+  Sv_mean_response_2, Sv_max_response_2, Sv_min_response_2, 
+  Sv_mean_response_3, Sv_max_response_3, Sv_min_response_3, 
+  Sv_mean_response_4, Sv_max_response_4, Sv_min_response_4, 
+  # Morphology
+  Height_mean, Uncorrected_length, Uncorrected_area, Uncorrected_thickness, Uncorrected_perimeter,  
+  Skewness, Kurtosis, Area_Backscatter_Strength,Thickness_mean,
+  Horizontal_roughness_coefficient, Vertical_roughness_coefficient, #ABC,
+  # Schooling behaviour
+  N_School_EDSU, Previous_school_distance, Later_school_distance, 
+  Mean_school_distance, Bottom_offset, Depth_mean, Mean_TS #, School_biomass,  School_P
+) %>% as.matrix
+
+## Study variables
+train_y <- traindata %>% dplyr::select(
+  ANE_P, PIL_P, HOM_P, HMM_P, MAC_P, VMA_P, SPR_P, BOC_P, MAV_P, KRX_P, Others_P) %>% as.matrix
+
+training <- cbind.data.frame(train_y, train_x)
+
+# Test data
+test_Haul_ID <- testdata %>% dplyr::select(Haul_ID)
+test_School_ID <- testdata %>% dplyr::select(School_ID)
+testdata <- testdata %>% dplyr::select(-X,-Survey,-Vessel)
+testdata$Year <- as.numeric(as.character(testdata$Year))
+testdata$Time_M <- as.numeric(hms(testdata$Time_M))
+testdata$Date_M <- as.numeric(ymd(testdata$Date_M))
+
+test_x <- testdata %>% dplyr::select(
+  # Haul info
+  Time_M, #Year, Date_M, 
+  # Positional
+  #Bathymetry, #Lat, Lon, 
+  # Energetic
+  Sv_max_LF, Sv_min_LF, Sv_mean_LF,  
+  Sv_max_MF, Sv_min_MF, Sv_mean_MF, 
+  Sv_max_HF, Sv_min_HF, Sv_mean_HF, 
+  Sv_mean_response_1, Sv_max_response_1, Sv_min_response_1, 
+  Sv_mean_response_2, Sv_max_response_2, Sv_min_response_2, 
+  Sv_mean_response_3, Sv_max_response_3, Sv_min_response_3, 
+  Sv_mean_response_4, Sv_max_response_4, Sv_min_response_4, 
+  # Morphology
+  Height_mean, Uncorrected_length, Uncorrected_area, Uncorrected_thickness, Uncorrected_perimeter,  
+  Skewness, Kurtosis, Area_Backscatter_Strength,Thickness_mean,
+  Horizontal_roughness_coefficient, Vertical_roughness_coefficient, #ABC,
+  # Schooling behaviour
+  N_School_EDSU, Previous_school_distance, Later_school_distance, 
+  Mean_school_distance, Bottom_offset, Depth_mean, Mean_TS #, School_biomass, School_P
+) %>% as.matrix
+
+test_y <- testdata %>% dplyr::select(
+  ANE_P, PIL_P, HOM_P, HMM_P, MAC_P, VMA_P, SPR_P, BOC_P, MAV_P, KRX_P, Others_P) %>% as.matrix
+```
+
+### Trawl data
+`data_y` is a data matrix which includes the study variables. Each column correspond to the species composition based on trawling catch data. Species proportions are estimated by catch weight with a range from 0 to 1. 
+
+```{r study variables}
+summary(train_y)
+```
+
+### School data
+`data_x` is a data matrix with all the explanatory variables. It adds the school information to the model to learn and classify each school into the most probable species. Here we have positional, morphological and energetic variables obtained from Echoview software. Moreover, frequency response (difference between high frequency and low frequency energy) and schooling properties were included. Number of schools, distance between schools and the mean target strength of the individuals around schools were included there.  
+
+```{r Explanatory variables}
+summary(train_x)
+```
+
+# School classification
+As many fishing hauls are mixed and we cannot assign a species to each haul without visual scrutiny, we decided to use multivariate models which allow to include a matrix input with the probability of each species based on trawl data. A regression model will be developed for each variable and the most probable species will be selected as the most probable species.
+
+## Generalized Least Square Model with elasticnet regularization (GLMNET)
+Glmnet fits generalized linear regression models via penalized maximum likelihood. The regularization path is computed for the lasso or elasticnet penalty at a grid of values for the regularization parameter lambda. 
+
+```{r Glmnet model}
+# Glmnet model
+set.seed(123)
+glmnet_model <- glmnet(train_x,train_y, alpha = 0, family = "mgaussian")
+
+# Cross-validatED glmnet model
+set.seed(123)
+cv.glmnet_model <- cv.glmnet(train_x, train_y, alpha = 0, family = "mgaussian")
+  
+  #lambda.min: the value of λ that gives minimum mean cross-validated error
+  lmin <- cv.glmnet_model$lambda.min
+  
+  #lambda.1se: thee value of λ that gives the most regularized model such that the cross-validated error is within one standard error of the minimum.
+  lse <- cv.glmnet_model$lambda.1se
+  
+# Variables importance
+glmnet_vi <- vi_model(glmnet_model)
+  glmnet_vi <- glmnet_vi[order(-glmnet_vi$Importance),c(1,2)]
+
+cv.glmnet_vi <- vi_model(cv.glmnet_model)
+  cv.glmnet_vi <- cv.glmnet_vi[order(-cv.glmnet_vi$Importance),c(1,2)] 
+
+# Predictions
+glmnet_predictions_train <- as.data.frame.table(predict(glmnet_model, newx = train_x, s = lse))
+
+glmnet_predictions_test <- as.data.frame.table(predict(glmnet_model, newx = test_x, s = lse))
+
+cv.glmnet_predictions_train <- as.data.frame.table(predict(cv.glmnet_model, newx = train_x))
+
+cv.glmnet_predictions_test <- as.data.frame.table(predict(cv.glmnet_model, newx = test_x))
+
+```
+
+```{r Glmnet predictions data frames, include=FALSE}
+glmnet_predictions_train <- pivot_wider(data=glmnet_predictions_train, names_from = "Var2", values_from = "Freq" )
+glmnet_predictions_train <- as.data.frame(glmnet_predictions_train[,c(-1,-2)])
+
+glmnet_predictions_test <- pivot_wider(data=glmnet_predictions_test, names_from = "Var2", values_from = "Freq" )
+glmnet_predictions_test <- as.data.frame(glmnet_predictions_test[,c(-1,-2)])
+  
+cv.glmnet_predictions_train <- pivot_wider(data=cv.glmnet_predictions_train, names_from = "Var2", values_from = "Freq" )
+cv.glmnet_predictions_train <- as.data.frame(cv.glmnet_predictions_train[,c(-1,-2)])
+
+cv.glmnet_predictions_test <- pivot_wider(data=cv.glmnet_predictions_test, names_from = "Var2", values_from = "Freq" )
+cv.glmnet_predictions_test <- as.data.frame(cv.glmnet_predictions_test[,c(-1,-2)])
+
+```
+
+```{r tables glmnet variables importance, echo=FALSE}
+glmnet_vi %>% 
+  kbl(caption = "Table 1. Variables importance for glmnet model") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+cv.glmnet_vi %>% 
+  kbl(caption = "Table 2. Variables importance for cv.glmnet model") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+## Multivariate random forest (MRF)
+Random forest consists of a large number of individual decision trees that operate as an ensemble. Each individual tree in the random forest spits out a class prediction and the class with the most votes becomes our model’s prediction. In multivariate random forest we can predict many variables multiple features at the same time considering the linear relation among the output features. 
+
+```{r Multivariate Random Forest}
+# Multivariate regression
+set.seed(123)
+mrf_model <- rfsrc(Multivar(ANE_P,
+                            PIL_P,
+                            HOM_P,
+                            HMM_P,
+                            MAC_P,
+                            VMA_P,
+                            SPR_P,
+                            BOC_P,
+                            MAV_P,
+                            KRX_P,
+                            Others_P)~., data = training)
+
+# Multivariate mixed regression
+set.seed(123)
+mmrf_model <- rfsrc(cbind(ANE_P,
+                          PIL_P,
+                          HOM_P,
+                          HMM_P,
+                          MAC_P,
+                          VMA_P,
+                          SPR_P,
+                          BOC_P,
+                          MAV_P,
+                          KRX_P,
+                          Others_P)~.,data = training)
+
+
+# MRF Variables importance
+oo1 <- subsample(mrf_model, verbose = FALSE)
+mrf_vi <- extract.subsample(oo1)$var.jk.sel.Z
+mrf_vi <- mrf_vi[order(mrf_vi$pvalue),c(4,5)]
+
+# MMRF Variables importance
+oo2 <- subsample(mmrf_model, verbose = FALSE)
+mmrf_vi <- extract.subsample(oo2)$var.jk.sel.Z
+mmrf_vi <- mmrf_vi[order(mmrf_vi$pvalue),c(4,5)]
+
+# Predictions
+mrf_predictions_train <- predict(mrf_model, newdata=traindata, importance=TRUE, get.tree=TRUE)
+mrf_predictions_test <- predict(mrf_model, newdata=testdata, importance=TRUE, get.tree=TRUE)
+mmrf_predictions_train <- predict(mmrf_model, newdata=traindata, importance=TRUE, get.tree=TRUE)
+mmrf_predictions_test <- predict(mmrf_model, newdata=testdata, importance=TRUE, get.tree=TRUE)
+
+```
+
+```{r tables mrf variables importance, echo=FALSE}
+mrf_vi %>% 
+  kbl(caption = "Table 3. Variables importance for mrf model") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+mmrf_vi %>% 
+  kbl(caption = "Table 4. Variables importance for mmrf model") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+```
+
+```{r MRF predictions´dataframes, include=FALSE}
+ 
+mrf_predictions_train <- cbind.data.frame(ANE=mrf_predictions_train$regrOutput$ANE_P$predicted,
+                                          PIL=mrf_predictions_train$regrOutput$PIL_P$predicted,
+                                          HOM=mrf_predictions_train$regrOutput$HOM_P$predicted,
+                                          HMM=mrf_predictions_train$regrOutput$HMM_P$predicted,
+                                          MAC=mrf_predictions_train$regrOutput$MAC_P$predicted,
+                                          VMA=mrf_predictions_train$regrOutput$VMA_P$predicted,
+                                          SPR=mrf_predictions_train$regrOutput$SPR_P$predicted,
+                                          BOC=mrf_predictions_train$regrOutput$BOC_P$predicted,
+                                          MAV=mrf_predictions_train$regrOutput$MAV_P$predicted,
+                                          KRX=mrf_predictions_train$regrOutput$KRX_P$predicted,
+                                          Others=mrf_predictions_train$regrOutput$Others_P$predicted)
+
+mrf_predictions_test <- cbind.data.frame( ANE=mrf_predictions_test$regrOutput$ANE_P$predicted,
+                                          PIL=mrf_predictions_test$regrOutput$PIL_P$predicted,
+                                          HOM=mrf_predictions_test$regrOutput$HOM_P$predicted,
+                                          HMM=mrf_predictions_test$regrOutput$HMM_P$predicted,
+                                          MAC=mrf_predictions_test$regrOutput$MAC_P$predicted,
+                                          VMA=mrf_predictions_test$regrOutput$VMA_P$predicted,
+                                          SPR=mrf_predictions_test$regrOutput$SPR_P$predicted,
+                                          BOC=mrf_predictions_test$regrOutput$BOC_P$predicted,
+                                          MAV=mrf_predictions_test$regrOutput$MAV_P$predicted,
+                                          KRX=mrf_predictions_test$regrOutput$KRX_P$predicted,
+                                          Others=mrf_predictions_test$regrOutput$Others_P$predicted)
+
+mmrf_predictions_train <-  cbind.data.frame(ANE=mmrf_predictions_train$regrOutput$ANE_P$predicted,
+                                            PIL=mmrf_predictions_train$regrOutput$PIL_P$predicted,
+                                            HOM=mmrf_predictions_train$regrOutput$HOM_P$predicted,
+                                            HMM=mmrf_predictions_train$regrOutput$HMM_P$predicted,
+                                            MAC=mmrf_predictions_train$regrOutput$MAC_P$predicted,
+                                            VMA=mmrf_predictions_train$regrOutput$VMA_P$predicted,
+                                            SPR=mmrf_predictions_train$regrOutput$SPR_P$predicted,
+                                            BOC=mmrf_predictions_train$regrOutput$BOC_P$predicted,
+                                            MAV=mmrf_predictions_train$regrOutput$MAV_P$predicted,
+                                            KRX=mmrf_predictions_train$regrOutput$KRX_P$predicted,
+                                            Others=mmrf_predictions_train$regrOutput$Others_P$predicted)
+
+mmrf_predictions_test <- cbind.data.frame(ANE=mmrf_predictions_test$regrOutput$ANE_P$predicted,
+                                          PIL=mmrf_predictions_test$regrOutput$PIL_P$predicted,
+                                          HOM=mmrf_predictions_test$regrOutput$HOM_P$predicted,
+                                          HMM=mmrf_predictions_test$regrOutput$HMM_P$predicted,
+                                          MAC=mmrf_predictions_test$regrOutput$MAC_P$predicted,
+                                          VMA=mmrf_predictions_test$regrOutput$VMA_P$predicted,
+                                          SPR=mmrf_predictions_test$regrOutput$SPR_P$predicted,
+                                          BOC=mmrf_predictions_test$regrOutput$BOC_P$predicted,
+                                          MAV=mmrf_predictions_test$regrOutput$MAV_P$predicted,
+                                          KRX=mmrf_predictions_test$regrOutput$KRX_P$predicted,
+                                          Others=mmrf_predictions_test$regrOutput$Others_P$predicted)
+
+```
+
+## Extreme Gradient Boosting (XGBOOST)
+Extreme gradient boosting ensembles are constructed from decision tree models. Trees are added one at a time to the ensemble and fit to correct the prediction errors made by prior models. XGBoost model is run in Python, thus it is necessary to change to python environment before running the model. 
+
+```{r}
+library(reticulate)
+use_condaenv("py3.8", required = TRUE)
+py_config()
+```
+
+``` {python Xgboost}
+import numpy as np
+from sklearn.multioutput import MultiOutputRegressor
+import xgboost as xgb
+
+# Input R data
+train_x = r.train_x
+train_y = r.train_y
+
+test_x = r.test_x
+test_y = r.test_y
+
+# Xgboost model
+multioutputregressor = MultiOutputRegressor(xgb.XGBRegressor(objective='reg:squarederror', seed=123)).fit(train_x, train_y)
+
+# Xgboost predictions
+xgboost_predictions_test = multioutputregressor.predict(test_x)
+xgboost_predictions_train = multioutputregressor.predict(train_x)
+
+```
+
+``` {r Xgboost Phyton predictions to R data frame, include=FALSE}
+xgboost_predictions_test <- as.data.frame(py$xgboost_predictions_test)
+xgboost_predictions_train <- as.data.frame(py$xgboost_predictions_train)
+```
+
+## Support Vector Machine (SVM)
+In Support Vector Machine learning the algorithm builds a  non-probabilistic binary linear classifier that assigns new examples to one category or the other. SVM maps training examples to points in space so as to maximize the width of the gap between the two categories. New examples are then mapped into that same space and predicted to belong to a category based on which side of the gap they fall. As XGBoost, multivariate SVM is run in Python environment. 
+
+``` {python SVM}
+from sklearn.datasets import make_regression
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+# Create the SVR regressor
+svr = SVR(epsilon=0.2)
+
+# Create the Multioutput Regressor
+mor = MultiOutputRegressor(svr)
+
+# Train the regressor
+mor = mor.fit(train_x, train_y)
+
+# Predictions
+svm_predictions_test = mor.predict(test_x)
+svm_predictions_train = mor.predict(train_x)
+
+```
+
+```{r SVM Phyton predictions to R dataframe, include=FALSE}
+svm_predictions_test <- as.data.frame(py$svm_predictions_test)
+svm_predictions_train <- as.data.frame(py$svm_predictions_train)
+```
+
+# Models' accuracy
+To estimate the accuracy we needed to calculate the proportion of species of each haul based on predicted classes and compare the predicted weight based probability with the proportions of species from trawling. Thus, first we predict haul`s species proportion.
+
+```{r Accuracy out of sample}
+species <- c("ANE","PIL","HOM","HMM","MAC","VMA","SPR","BOC","MAV","KRX","Others")
+
+predictions_out_sample <- list("glmnet_predictions_test" = glmnet_predictions_test,
+                              "mrf_predictions_test" = mrf_predictions_test, 
+                              "xgboost_predictions_test" = xgboost_predictions_test,
+                              "svm_predictions_test" = svm_predictions_test) 
+
+
+for (x in 1:length(predictions_out_sample)) {
+
+predictions <-  as.data.frame(predictions_out_sample[x])
+colnames(predictions) <- species
+
+# Create a new column with the most probable species based on the highest probability
+predictions$most_probable <- colnames(predictions)[apply(predictions,1,which.max)]
+
+#Most probable species (1) / not probable (0) table
+presence_predictions <- predictions [,-12]
+
+for (i in 1:nrow(presence_predictions)){
+  for (j in 1:ncol(presence_predictions)){
+    presence_predictions [i,j] <- ifelse(presence_predictions [i,j] == max(presence_predictions[i,]),1,0) 
+  }
+}
+
+presence_predictions <- cbind.data.frame(test_School_ID, presence_predictions [,-11])
+
+#Loading the data frame from "data" with the school biomass of in case of belonging to each species
+biomass <- testdata %>% dplyr::select(Haul_ID, School_ID, ANE_school_bio:Total_School_Biomass)
+
+#Create a new data frame which select the school biomass of the most probable species using the biomass of all species and the presence of the unique classifies species
+School_biomass <- inner_join(presence_predictions, biomass, by="School_ID") %>% 
+  mutate(ANE_biomass=ANE*ANE_school_bio,
+         PIL_biomass=PIL*PIL_school_bio,
+         HOM_biomass=HOM*HOM_school_bio,
+         HMM_biomass=HMM*HMM_school_bio,
+         MAC_biomass=MAC*MAC_school_bio,
+         VMA_biomass=VMA*VMA_school_bio,
+         SPR_biomass=SPR*SPR_school_bio,
+         BOC_biomass=BOC*BOC_school_bio,
+         MAV_biomass=MAV*MAV_school_bio,
+         KRX_biomass=KRX*KRX_school_bio,
+  )
+
+# Sum all biomass of each species in the haul
+Haul_biomass <- as.data.frame(School_biomass %>% group_by (Haul_ID)%>%
+                                summarise(ANE_biomass=sum(ANE_biomass),
+                                          PIL_biomass=sum(PIL_biomass),
+                                          HOM_biomass=sum(HOM_biomass),
+                                          HMM_biomass=sum(HMM_biomass),
+                                          MAC_biomass=sum(MAC_biomass),
+                                          VMA_biomass=sum(VMA_biomass),
+                                          SPR_biomass=sum(SPR_biomass),
+                                          BOC_biomass=sum(BOC_biomass),      
+                                          MAV_biomass=sum(MAV_biomass),
+                                          KRX_biomass=sum(KRX_biomass)) 
+                              %>% ungroup()
+)
+
+#Sum all biomass in the haul
+for (i in 1:nrow(Haul_biomass)) {
+  Haul_biomass$Total_biomass [i] <- sum(Haul_biomass[i,2:11])
+}
+
+#Estimate the percentage of each species in each haul
+Haul_percentage <- Haul_biomass
+
+for (i in 1:dim(Haul_percentage)[1]) {
+  Haul_percentage$ANE_biomass [i] <- Haul_percentage$ANE_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$PIL_biomass [i] <- Haul_percentage$PIL_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$HOM_biomass [i] <- Haul_percentage$HOM_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$HMM_biomass [i] <- Haul_percentage$HMM_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$MAC_biomass [i] <- Haul_percentage$MAC_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$VMA_biomass [i] <- Haul_percentage$VMA_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$SPR_biomass [i] <- Haul_percentage$SPR_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$BOC_biomass [i] <- Haul_percentage$BOC_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$MAV_biomass [i] <- Haul_percentage$MAV_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$KRX_biomass [i] <- Haul_percentage$KRX_biomass [i] /  Haul_percentage$Total_biomass [i]
+  Haul_percentage$sum [i] <- sum(Haul_percentage[i, 2:11]) 
+}
+
+# Delete Predicted as Others as it is not possible to estimate their biomass 
+Haul_percentage <- na.omit(Haul_percentage) 
+
+
+# Load the true haul percentages obtained from trawling
+true_percentages <- hauls %>% filter(hauls$Haul_ID %in% Haul_percentage$Haul_ID) %>% dplyr::select(Haul_ID,ANE_P: KRX_P)
+
+Haul_percentage <- Haul_percentage[,c(-12,-13)]
+colnames(Haul_percentage) <- c("Haul_ID", species[-11])
+
+Haul_percentage <- Haul_percentage [order(Haul_percentage$Haul_ID),]
+true_percentages <- true_percentages [order(true_percentages$Haul_ID),]
+head(Haul_percentage);head(true_percentages)
+
+#RMSE
+(rmse_ANE <- rmse(true_percentages$ANE_P, Haul_percentage$ANE))
+(rmse_PIL <- rmse(true_percentages$PIL_P, Haul_percentage$PIL))
+(rmse_HOM <- rmse(true_percentages$HOM_P, Haul_percentage$HOM))
+(rmse_HMM <- rmse(true_percentages$HMM_P, Haul_percentage$HMM))
+(rmse_MAC <- rmse(true_percentages$MAC_P, Haul_percentage$MAC))
+(rmse_VMA <- rmse(true_percentages$VMA_P, Haul_percentage$VMA))
+(rmse_SPR <- rmse(true_percentages$SPR_P, Haul_percentage$SPR))
+(rmse_BOC <- rmse(true_percentages$BOC_P, Haul_percentage$BOC))
+(rmse_MAV <- rmse(true_percentages$MAV_P, Haul_percentage$MAV))
+(rmse_KRX <- rmse(true_percentages$KRX_P, Haul_percentage$KRX))
+
+# Each species Root Mean Square Error (RMSE)
+spp_rmse <- cbind.data.frame(rmse_ANE, rmse_PIL, rmse_HOM, rmse_HMM, rmse_MAC, rmse_VMA, rmse_SPR, rmse_BOC, rmse_MAV, rmse_KRX) 
+assign(paste(names(predictions_out_sample[x]), "spp_rmse", sep="_"), spp_rmse) 
+
+# Model RMSE
+exp <- as.numeric(rbind(true_percentages$ANE_P, true_percentages$PIL_P, true_percentages$HOM_P, true_percentages$HMM_P, true_percentages$MAC_P, true_percentages$VMA_P, true_percentages$SPR_P,  true_percentages$BOC_P, true_percentages$MAV_P, true_percentages$KRX_P))
+obs <- as.numeric(rbind(Haul_percentage$ANE, Haul_percentage$PIL, Haul_percentage$HOM, Haul_percentage$HMM, Haul_percentage$MAC, Haul_percentage$VMA, Haul_percentage$SPR, Haul_percentage$BOC, Haul_percentage$MAV, Haul_percentage$KRX))
+
+rmse <- rmse(exp, obs)
+assign(paste(names(predictions_out_sample[x]), "rmse", sep = "_"), rmse)
+
+}
+```
+
+```{r Accuracy in sample}
+
+predictions_in_sample <- list("glmnet_predictions_train" = glmnet_predictions_train, 
+                              "mrf_predictions_train" = mrf_predictions_train, 
+                              "xgboost_predictions_train" = xgboost_predictions_train,
+                              "svm_predictions_train" = svm_predictions_train)
+
+for (x in 1:length(predictions_in_sample)) {
+
+  predictions <-  as.data.frame(predictions_in_sample[x])
+  colnames(predictions) <- species
+  
+  # Create a new column with the most probable species based on the highest probability
+  predictions$most_probable <- colnames(predictions)[apply(predictions,1,which.max)]
+  
+  #Most probable species (1) / not probable (0) table
+  presence_predictions <- predictions [,-12]
+  for (i in 1:nrow(presence_predictions)){
+    for (j in 1:ncol(presence_predictions)){
+      presence_predictions [i,j] <- ifelse(presence_predictions [i,j] == max(presence_predictions[i,]),1,0) 
+    }
+  }
+  
+  presence_predictions <- cbind.data.frame(train_School_ID, presence_predictions [,-11])
+  
+  #Loading the data frame from "data" with the school biomass of in case of belonging to each species
+  biomass <- traindata %>% dplyr::select(Haul_ID, School_ID, ANE_school_bio:Total_School_Biomass)
+  
+  #Create a new data frame which select the school biomass of the most probable species using the biomass of all species and the presence of the unique classifies species
+  School_biomass <- inner_join(presence_predictions, biomass, by="School_ID") %>% 
+    mutate(ANE_biomass=ANE*ANE_school_bio,
+           PIL_biomass=PIL*PIL_school_bio,
+           HOM_biomass=HOM*HOM_school_bio,
+           HMM_biomass=HMM*HMM_school_bio,
+           MAC_biomass=MAC*MAC_school_bio,
+           VMA_biomass=VMA*VMA_school_bio,
+           SPR_biomass=SPR*SPR_school_bio,
+           BOC_biomass=BOC*BOC_school_bio,
+           MAV_biomass=MAV*MAV_school_bio,
+           KRX_biomass=KRX*KRX_school_bio,
+    )
+  
+  # Sum all biomass of each species in the haul
+  Haul_biomass <- as.data.frame(School_biomass %>% group_by (Haul_ID)%>%
+                                  summarise(ANE_biomass=sum(ANE_biomass),
+                                            PIL_biomass=sum(PIL_biomass),
+                                            HOM_biomass=sum(HOM_biomass),
+                                            HMM_biomass=sum(HMM_biomass),
+                                            MAC_biomass=sum(MAC_biomass),
+                                            VMA_biomass=sum(VMA_biomass),
+                                            SPR_biomass=sum(SPR_biomass),
+                                            BOC_biomass=sum(BOC_biomass),      
+                                            MAV_biomass=sum(MAV_biomass),
+                                            KRX_biomass=sum(KRX_biomass)) 
+                                %>% ungroup()
+  )
+  
+  #Sum all biomass in the haul
+  for (i in 1:nrow(Haul_biomass)) {
+    Haul_biomass$Total_biomass [i] <- sum(Haul_biomass[i,2:11])
+  }
+  
+  #Estimate the percentage of each species in each haul
+  Haul_percentage <- Haul_biomass
+  
+  for (i in 1:dim(Haul_percentage)[1]) {
+    Haul_percentage$ANE_biomass [i] <- Haul_percentage$ANE_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$PIL_biomass [i] <- Haul_percentage$PIL_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$HOM_biomass [i] <- Haul_percentage$HOM_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$HMM_biomass [i] <- Haul_percentage$HMM_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$MAC_biomass [i] <- Haul_percentage$MAC_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$VMA_biomass [i] <- Haul_percentage$VMA_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$SPR_biomass [i] <- Haul_percentage$SPR_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$BOC_biomass [i] <- Haul_percentage$BOC_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$MAV_biomass [i] <- Haul_percentage$MAV_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$KRX_biomass [i] <- Haul_percentage$KRX_biomass [i] /  Haul_percentage$Total_biomass [i]
+    Haul_percentage$sum [i] <- sum(Haul_percentage[i, 2:11]) 
+  }
+  
+  # Delete Predicted as Others as it is not possible to estimate their biomass 
+  Haul_percentage <- na.omit(Haul_percentage) 
+  
+  
+  # Load the true haul percentages obtained from trawling
+  true_percentages <- hauls %>% filter(hauls$Haul_ID %in% Haul_percentage$Haul_ID) %>% dplyr::select(Haul_ID,ANE_P: KRX_P)
+  
+  Haul_percentage <- Haul_percentage[,c(-12,-13)]
+  colnames(Haul_percentage) <- c("Haul_ID", species[-11])
+  
+  Haul_percentage <- Haul_percentage [order(Haul_percentage$Haul_ID),]
+  true_percentages <- true_percentages [order(true_percentages$Haul_ID),]
+  head(Haul_percentage);head(true_percentages)
+  
+  #RMSE
+  (rmse_ANE <- rmse(true_percentages$ANE_P, Haul_percentage$ANE))
+  (rmse_PIL <- rmse(true_percentages$PIL_P, Haul_percentage$PIL))
+  (rmse_HOM <- rmse(true_percentages$HOM_P, Haul_percentage$HOM))
+  (rmse_HMM <- rmse(true_percentages$HMM_P, Haul_percentage$HMM))
+  (rmse_MAC <- rmse(true_percentages$MAC_P, Haul_percentage$MAC))
+  (rmse_VMA <- rmse(true_percentages$VMA_P, Haul_percentage$VMA))
+  (rmse_SPR <- rmse(true_percentages$SPR_P, Haul_percentage$SPR))
+  (rmse_BOC <- rmse(true_percentages$BOC_P, Haul_percentage$BOC))
+  (rmse_MAV <- rmse(true_percentages$MAV_P, Haul_percentage$MAV))
+  (rmse_KRX <- rmse(true_percentages$KRX_P, Haul_percentage$KRX))
+  
+  # Each species Root Mean Square Error (RMSE)
+  spp_rmse <- cbind.data.frame(rmse_ANE, rmse_PIL, rmse_HOM, rmse_HMM, rmse_MAC, rmse_VMA, rmse_SPR, rmse_BOC, rmse_MAV, rmse_KRX) 
+  assign(paste(names(predictions_in_sample)[x], "spp_rmse", sep="_"), spp_rmse) 
+  
+  # Model RMSE
+  exp <- as.numeric(rbind(true_percentages$ANE_P, true_percentages$PIL_P, true_percentages$HOM_P, true_percentages$HMM_P, true_percentages$MAC_P, true_percentages$VMA_P, true_percentages$SPR_P,  true_percentages$BOC_P, true_percentages$MAV_P, true_percentages$KRX_P))
+  obs <- as.numeric(rbind(Haul_percentage$ANE, Haul_percentage$PIL, Haul_percentage$HOM, Haul_percentage$HMM, Haul_percentage$MAC, Haul_percentage$VMA, Haul_percentage$SPR, Haul_percentage$BOC, Haul_percentage$MAV, Haul_percentage$KRX))
+  
+  rmse <- rmse(exp, obs)
+  assign(paste(names(predictions_in_sample[x]), "rmse", sep = "_"), rmse)
+  
+}
+
+```
+
+```{r Number of schools for accuracy, include=FALSE}
+
+ANE_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & ANE_P>0.25)%>% summarize(count=n())
+ANE_schools <- traindata %>% filter(ANE_P>0.25)%>% summarize(count=n())
+PIL_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & PIL_P>0.25)%>% summarize(count=n())
+PIL_schools <- traindata %>% filter(PIL_P>0.25)%>% summarize(count=n())
+HOM_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & HOM_P>0.25)%>% summarize(count=n())
+HOM_schools <- traindata %>% filter(HOM_P>0.25)%>% summarize(count=n())
+HMM_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & HMM_P>0.25)%>% summarize(count=n())
+HMM_schools <- traindata %>% filter(HMM_P>0.25)%>% summarize(count=n())
+MAC_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & MAC_P>0.25)%>% summarize(count=n())
+MAC_schools <- traindata %>% filter(MAC_P>0.25)%>% summarize(count=n())
+VMA_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & VMA_P>0.25)%>% summarize(count=n())
+VMA_schools <- traindata %>% filter(VMA_P>0.25)%>% summarize(count=n())
+SPR_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & SPR_P>0.25)%>% summarize(count=n())
+SPR_schools <- traindata %>% filter(SPR_P>0.25)%>% summarize(count=n())
+BOC_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & BOC_P>0.25)%>% summarize(count=n())
+BOC_schools <- traindata %>% filter(BOC_P>0.25)%>% summarize(count=n())
+MAV_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & MAV_P>0.25)%>% summarize(count=n())
+MAV_schools <- traindata %>% filter(MAV_P>0.25)%>% summarize(count=n())
+KRX_hauls <- hauls %>% filter(Haul_ID %in% traindata$Haul_ID & KRX_P>0.25)%>% summarize(count=n())
+KRX_schools <- traindata %>% filter(KRX_P>0.25)%>% summarize(count=n())
+
+N_schools_training <- cbind.data.frame(ANE_schools,PIL_schools,HOM_schools,HMM_schools,MAC_schools,VMA_schools,SPR_schools,BOC_schools,MAV_schools,KRX_schools)
+colnames(N_schools_training) <- colnames(spp_rmse)
+
+N_hauls_training <- cbind.data.frame(ANE_hauls, PIL_hauls, HOM_hauls, HMM_hauls, MAC_hauls,VMA_hauls, SPR_hauls, BOC_hauls, MAV_hauls,KRX_hauls)
+colnames(N_hauls_training) <- colnames(spp_rmse)
+
+ANE_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & ANE_P>0.25)%>% summarize(count=n())
+ANE_schools <- testdata %>% filter(ANE_P>0.25)%>% summarize(count=n())
+PIL_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & PIL_P>0.25)%>% summarize(count=n())
+PIL_schools <- testdata %>% filter(PIL_P>0.25)%>% summarize(count=n())
+HOM_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & HOM_P>0.25)%>% summarize(count=n())
+HOM_schools <- testdata %>% filter(HOM_P>0.25)%>% summarize(count=n())
+HMM_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & HMM_P>0.25)%>% summarize(count=n())
+HMM_schools <- testdata %>% filter(HMM_P>0.25)%>% summarize(count=n())
+MAC_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & MAC_P>0.25)%>% summarize(count=n())
+MAC_schools <- testdata %>% filter(MAC_P>0.25)%>% summarize(count=n())
+VMA_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & VMA_P>0.25)%>% summarize(count=n())
+VMA_schools <- testdata %>% filter(VMA_P>0.25)%>% summarize(count=n())
+SPR_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & SPR_P>0.25)%>% summarize(count=n())
+SPR_schools <- testdata %>% filter(SPR_P>0.25)%>% summarize(count=n())
+BOC_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & BOC_P>0.25)%>% summarize(count=n())
+BOC_schools <- testdata %>% filter(BOC_P>0.25)%>% summarize(count=n())
+MAV_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & MAV_P>0.25)%>% summarize(count=n())
+MAV_schools <- testdata %>% filter(MAV_P>0.25)%>% summarize(count=n())
+KRX_hauls <- hauls %>% filter(Haul_ID %in% testdata$Haul_ID & KRX_P>0.25)%>% summarize(count=n())
+KRX_schools <- testdata %>% filter(KRX_P>0.25)%>% summarize(count=n())
+
+N_schools_test <- cbind.data.frame(ANE_schools,PIL_schools,HOM_schools,HMM_schools,MAC_schools,VMA_schools,SPR_schools,BOC_schools,MAV_schools,KRX_schools)
+colnames(N_schools_test) <- colnames(spp_rmse)
+
+N_hauls_test <- cbind.data.frame(ANE_hauls, PIL_hauls, HOM_hauls, HMM_hauls, MAC_hauls,VMA_hauls, SPR_hauls, BOC_hauls, MAV_hauls,KRX_hauls)
+colnames(N_hauls_test) <- colnames(spp_rmse)
+
+```
+
+```{r Root Mean Squared Error, include=FALSE}
+
+classification_outsample_RMSE <- cbind.data.frame(sum(N_hauls_test), sum(N_schools_test), glmnet_predictions_test_rmse, mrf_predictions_test_rmse, xgboost_predictions_test_rmse, svm_predictions_test_rmse)
+colnames(classification_outsample_RMSE) <- c("Hauls", "Schools", "glmnet", "mrf", "xgboost", "svm")
+classification_outsample_RMSE
+
+classification_insample_RMSE <- cbind.data.frame(sum(N_hauls_training), sum(N_schools_training), glmnet_predictions_train_rmse, mrf_predictions_train_rmse, xgboost_predictions_train_rmse, svm_predictions_train_rmse)
+colnames(classification_insample_RMSE) <- c("Hauls", "Schools", "glmnet", "mrf", "xgboost", "svm")
+classification_insample_RMSE
+
+spp_outsample_RMSE <- rbind.data.frame(format(N_hauls_test,scientific=F), format(N_schools_test,scientific=F), format(glmnet_predictions_test_spp_rmse,scientific=T, digits=4), format(mrf_predictions_test_spp_rmse, scientific=T, digits=4), format(xgboost_predictions_test_spp_rmse,scientific=T, digits=4), format(svm_predictions_test_spp_rmse,scientific=T, digits=4))
+rownames(spp_outsample_RMSE) <- c("Test hauls", "Test schools", "glmnet", "mrf", "xgboost", "svm")
+spp_outsample_RMSE
+
+spp_insample_RMSE <- rbind.data.frame(format(N_hauls_training,scientific=F), format(N_schools_training,scientific=F), format(glmnet_predictions_train_spp_rmse,scientific=T, digits=4), format(mrf_predictions_train_spp_rmse, scientific=T, digits=4), format(xgboost_predictions_train_spp_rmse,scientific=T, digits=4), format(svm_predictions_train_spp_rmse,scientific=T, digits=4))
+rownames(spp_insample_RMSE) <- c("Training hauls", "Training schools", "glmnet", "mrf", "xgboost", "svm")
+spp_insample_RMSE
+
+```
+
+```{r tables Model comparison and species classification, echo=FALSE}
+classification_outsample_RMSE %>% 
+  kbl(caption = "Table 5. Results of the Root Mean Square Error (RMSE) of the classification models out of samples") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+classification_insample_RMSE %>% 
+  kbl(caption = "Table 6. Results of the Root Mean Square Error (RMSE) of the classification models in samples") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+spp_outsample_RMSE %>%
+  kbl(caption="Table 7. Results of the Root Mean Square Error (RMSE) of the classification of each species out of samples. Number of hauls and schools calculated for hauls with >0.25% of presence.") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+spp_insample_RMSE %>%
+  kbl(caption="Table 8. Results of the Root Mean Square Error (RMSE) of the classification of each species in samples. Number of hauls and schools calculated for hauls with >0.25% of presence.") %>%
+  kable_classic(full_width = F, html_font = "Cambria")
+
+```
+
+# Data distribution maps
+
+
+```{r juvena maps, include=FALSE}
+source("Maps/mapa base.R")
+
+
+```
+
+## Train and test data
+```{r Training data distribution, out.width = '85%', fig.cap = 'Figure 1. The distibution map of training and test data o fit the classification model. Blue points: traindata. Red point: testdata'}
+traindata$Data <- "train"
+testdata$Data <- "test"
+data_map <- rbind.data.frame(traindata,testdata)
+mapabase.rads +
+    geom_point(aes(x = Lon, y = Lat, colour=Data), data = data_map, alpha=0.01, size=5) +
+    guides(colour = guide_legend(override.aes = list(alpha=1)), )+
+coord_equal() 
+```
+
+## Anchovy
+```{r Anchovy training distribution, out.width = '90%', fig.cap = 'Figure 2. The distibution map of anchovy in the training data to fit the classification model'}
+ANE_train <- traindata %>% filter (ANE_P>0)
+  ANE_train$Data <- "train"
+ANE_test <- testdata %>% filter (ANE_P>0)
+  ANE_test$Data <- "test"
+ANE_map <- rbind.data.frame(ANE_train, ANE_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=ANE_P, colour=Data), data = ANE_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)), )+
+   coord_equal() 
+
+```
+
+## Sardine
+```{r Sardine training distribution, out.width = '90%', fig.cap = 'Figure 3. The distibution map of sardine in the training data to fit the classification model'}
+PIL_train <- traindata %>% filter (PIL_P>0)
+  PIL_train$Data <- "train"
+PIL_test <- testdata %>% filter (PIL_P>0)
+  PIL_test$Data <- "test"
+PIL_map <- rbind.data.frame(PIL_train, PIL_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=PIL_P, colour=Data), data = PIL_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Horse mackerel
+```{r Horse mackerel training distribution, out.width = '90%', fig.cap = 'Figure 4. The distibution map of horse mackerel in the training data to fit the classification model'}
+HOM_train <- traindata %>% filter (HOM_P>0)
+  HOM_train$Data <- "train"
+HOM_test <- testdata %>% filter (HOM_P>0)
+  HOM_test$Data <- "test"
+HOM_map <- rbind.data.frame(HOM_train, HOM_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=HOM_P, colour=Data), data = HOM_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Mediterranean horse mackerel
+```{r Mediterranean mackerel training distribution, out.width = '90%', fig.cap = 'Figure 5. The distibution map of mediterranean horse mackerel in the training data to fit the classification model'}
+HMM_train <- traindata %>% filter (HMM_P>0)
+  HMM_train$Data <- "train"
+HMM_test <- testdata %>% filter (HMM_P>0)
+#  HMM_test$Data <- "test"
+HMM_map <- rbind.data.frame(HMM_train, HMM_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=HMM_P, colour=Data), data = HMM_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Atlantic mackerel
+```{r Atlantic mackerel training distribution, out.width = '90%', fig.cap = 'Figure 6. The distibution map of Atlantic mackerel in the training data to fit the classification model'}
+MAC_train <- traindata %>% filter (MAC_P>0)
+  MAC_train$Data <- "train"
+MAC_test <- testdata %>% filter (MAC_P>0)
+  MAC_test$Data <- "test"
+MAC_map <- rbind.data.frame(MAC_train, MAC_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=MAC_P, colour=Data), data = MAC_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Atlantic chub mackerel
+```{r Atlantic chub mackerel training distribution, out.width = '90%', fig.cap = 'Figure 7. The distibution map of Atlantic chub mackerel in the training data to fit the classification model'}
+VMA_train <- traindata %>% filter (VMA_P>0)
+  VMA_train$Data <- "train"
+VMA_test <- testdata %>% filter (VMA_P>0)
+  VMA_test$Data <- "test"
+VMA_map <- rbind.data.frame(VMA_train, VMA_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=VMA_P, colour=Data), data = VMA_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Sprat
+```{r Sprat training distribution, out.width = '90%', fig.cap = 'Figure 8. The distibution map of sprat in the training data to fit the classification model'}
+SPR_train <- traindata %>% filter (SPR_P>0)
+  SPR_train$Data <- "train"
+SPR_test <- testdata %>% filter (SPR_P>0)
+  SPR_test$Data <- "test"
+SPR_map <- rbind.data.frame(SPR_train, SPR_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=SPR_P, colour=Data), data = SPR_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Boarfish
+```{r Boarfish training distribution, out.width = '90%', fig.cap = 'Figure 9. The distibution map of boarfish in the training data to fit the classification model'}
+BOC_train <- traindata %>% filter (BOC_P>0)
+  BOC_train$Data <- "train"
+BOC_test <- testdata %>% filter (BOC_P>0)
+#  BOC_test$Data <- "test"
+BOC_map <- rbind.data.frame(BOC_train, BOC_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=BOC_P, colour=Data), data = BOC_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Muller´s pearside
+```{r Mauroliccus training distribution, out.width = '90%', fig.cap = 'Figure 10. The distibution map of Muller´s pearsides in the training data to fit the classification model'}
+MAV_train <- traindata %>% filter (MAV_P>0)
+  MAV_train$Data <- "train"
+MAV_test <- testdata %>% filter (MAV_P>0)
+  MAV_test$Data <- "test"
+MAV_map <- rbind.data.frame(MAV_train, MAV_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=MAV_P, colour=Data), data = MAV_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
+## Krill
+```{r Krill training distribution, out.width = '90%', fig.cap = 'Figure 11. The distibution map of krill in the training data to fit the classification model'}
+KRX_train <- traindata %>% filter (KRX_P>0)
+  KRX_train$Data <- "train"
+KRX_test <- testdata %>% filter (KRX_P>0)
+#  KRX_test$Data <- "test"
+KRX_map <- rbind.data.frame(KRX_train, KRX_test)
+
+mapabase.rads +
+  geom_point(aes(x = Lon, y = Lat, size=KRX_P, colour=Data), data = KRX_map, alpha=0.01) +
+  guides(colour = guide_legend(override.aes = list(alpha=1)))+
+   coord_equal() 
+```
+
